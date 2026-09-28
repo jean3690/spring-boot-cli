@@ -2,6 +2,11 @@
 
 [English](./README.md) | 简体中文
 
+[![npm version](https://img.shields.io/npm/v/@jeangrey/sbc.svg)](https://www.npmjs.com/package/@jeangrey/sbc)
+[![npm downloads](https://img.shields.io/npm/dm/@jeangrey/sbc.svg)](https://www.npmjs.com/package/@jeangrey/sbc)
+[![license](https://img.shields.io/npm/l/@jeangrey/sbc.svg)](./LICENSE)
+[![node](https://img.shields.io/node/v/@jeangrey/sbc.svg)](https://nodejs.org)
+
 一个 `vue-cli` 风格的交互式命令行工具，用于**创建、搜索并运行** Spring Boot 项目——支持 monorepo 架构，底层由 [Spring Initializr](https://start.spring.io) 驱动。
 
 ## 功能特性

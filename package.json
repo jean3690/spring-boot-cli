@@ -1,7 +1,7 @@
 {
   "name": "@jeangrey/sbc",
-  "version": "0.1.0",
-  "description": "A vue-cli style interactive CLI to scaffold Spring Boot projects, powered by Spring Initializr.",
+  "version": "0.2.0",
+  "description": "A vue-cli style interactive CLI to scaffold, search and run Spring Boot projects (monorepo-aware), powered by Spring Initializr.",
   "type": "module",
   "bin": {
     "sbc": "dist/index.js"
@@ -15,14 +15,17 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "prepublishOnly": "pnpm build"
   },
   "keywords": [
     "spring-boot",
     "cli",
     "scaffold",
     "initializr",
-    "generator"
+    "generator",
+    "monorepo",
+    "spring-initializr"
   ],
   "license": "ISC",
   "engines": {

@@ -2,6 +2,11 @@
 
 English | [简体中文](./README.zh-CN.md)
 
+[![npm version](https://img.shields.io/npm/v/@jeangrey/sbc.svg)](https://www.npmjs.com/package/@jeangrey/sbc)
+[![npm downloads](https://img.shields.io/npm/dm/@jeangrey/sbc.svg)](https://www.npmjs.com/package/@jeangrey/sbc)
+[![license](https://img.shields.io/npm/l/@jeangrey/sbc.svg)](./LICENSE)
+[![node](https://img.shields.io/node/v/@jeangrey/sbc.svg)](https://nodejs.org)
+
 A `vue-cli` style interactive CLI to **scaffold, search and run** Spring Boot projects — monorepo-aware, powered by [Spring Initializr](https://start.spring.io).
 
 ## Features
