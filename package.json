@@ -1,0 +1,49 @@
+{
+  "name": "@jeangrey/sbc",
+  "version": "0.1.0",
+  "description": "A vue-cli style interactive CLI to scaffold Spring Boot projects, powered by Spring Initializr.",
+  "type": "module",
+  "bin": {
+    "sbc": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "spring-boot",
+    "cli",
+    "scaffold",
+    "initializr",
+    "generator"
+  ],
+  "license": "ISC",
+  "engines": {
+    "node": ">=18"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.21.0",
+      "onFail": "download"
+    }
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.8.1",
+    "commander": "^15.0.0",
+    "fflate": "^0.8.3",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2"
+  }
+}
