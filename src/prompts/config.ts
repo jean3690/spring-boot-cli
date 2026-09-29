@@ -2,10 +2,12 @@ import * as p from "@clack/prompts";
 import {
   searchDependencies,
   isStableBootVersion,
+  type ConfigFormat,
   type InitializrMetadata,
   type ProjectConfig,
   type ValueItem,
 } from "../api/initializr.js";
+import { isValidPropertyKey, parseProperties, parsePropertyLine } from "../properties.js";
 import { derivePackageName, isValidArtifactId, isValidGroupId, isValidPackageName } from "../validate.js";
 
 export interface CliFlags {
@@ -20,6 +22,8 @@ export interface CliFlags {
   packageName?: string;
   packaging?: string;
   deps?: string;
+  configFormat?: string;
+  set?: string[];
 }
 
 function toOptions(values: ValueItem[]): { value: string; label: string; hint?: string }[] {
@@ -90,6 +94,8 @@ export async function buildConfig(
     packaging: metadata.packaging.default,
     version: "0.0.1-SNAPSHOT",
     dependencies: [],
+    configFormat: "properties",
+    properties: [],
   };
 
   const ask = async <T>(prompt: () => Promise<T>): Promise<T | undefined> =>
@@ -244,21 +250,94 @@ export async function buildConfig(
     }
     config.dependencies = ids;
   } else {
+    // Category is part of the label so it is always visible and searchable:
+    // typing a category name (e.g. "sql") lists that whole category.
     const options = searchDependencies(metadata, "").map(({ group, dep }) => ({
       value: dep.id,
-      label: dep.name,
-      hint: dep.description ? `${group} · ${dep.description}` : group,
+      label: `${group} · ${dep.name}`,
+      ...(dep.description ? { hint: dep.description } : {}),
     }));
     config.dependencies = handleCancel(
       (await ask(() =>
         p.autocompleteMultiselect({
-          message: "Dependencies (type to search, space to toggle, enter to confirm)",
+          message: "Dependencies (search by name or category, space to toggle, enter to confirm)",
           options,
           required: false,
           maxItems: 12,
         }),
       )) ?? [],
     );
+  }
+
+  // --- Config file format & custom properties ---
+  const requestedFormat = flags.configFormat?.toLowerCase();
+  if (requestedFormat && requestedFormat !== "properties" && requestedFormat !== "yml") {
+    p.log.warn(`Unknown --config-format "${flags.configFormat}", using properties.`);
+  }
+  const defaultFormat: ConfigFormat = requestedFormat === "yml" ? "yml" : "properties";
+
+  config.configFormat = nonInteractive
+    ? defaultFormat
+    : handleCancel(
+        await p.select<ConfigFormat>({
+          message: "Config file format",
+          initialValue: defaultFormat,
+          options: [
+            { value: "properties", label: "application.properties" },
+            { value: "yml", label: "application.yml" },
+          ],
+        }),
+      );
+
+  // Entries passed via repeated --set key=value flags.
+  const fromFlags: string[] = [];
+  for (const raw of flags.set ?? []) {
+    const entry = parsePropertyLine(raw);
+    if (!entry) {
+      p.log.warn(`Ignoring invalid --set value "${raw}" (expected key=value).`);
+      continue;
+    }
+    if (!isValidPropertyKey(entry.key)) {
+      p.log.warn(`Ignoring --set with invalid property key "${entry.key}".`);
+      continue;
+    }
+    fromFlags.push(`${entry.key}=${entry.value}`);
+  }
+
+  if (nonInteractive) {
+    config.properties = fromFlags;
+  } else {
+    const fileName = config.configFormat === "yml" ? "application.yml" : "application.properties";
+    const addCustom = handleCancel(
+      await p.confirm({
+        message: `Add custom ${fileName} entries? (Enter to skip)`,
+        initialValue: false,
+      }),
+    );
+    if (addCustom) {
+      const input = handleCancel(
+        await p.multiline({
+          message: `Enter ${fileName} entries (key=value per line)`,
+          placeholder: "server.port=8080",
+          initialValue: fromFlags.join("\n"),
+          validate: (value) => {
+            for (const line of (value ?? "").split("\n")) {
+              if (!line.trim()) continue;
+              const entry = parsePropertyLine(line);
+              if (!entry) return `Invalid line "${line.trim()}" — expected key=value`;
+              if (!isValidPropertyKey(entry.key)) return `Invalid property key "${entry.key}"`;
+            }
+            return undefined;
+          },
+        }),
+      );
+      config.properties =
+        (input ?? "").trim() === ""
+          ? fromFlags
+          : parseProperties(input).map((e) => `${e.key}=${e.value}`);
+    } else {
+      config.properties = fromFlags;
+    }
   }
 
   return config;

@@ -34,6 +34,8 @@ export interface InitializrMetadata {
   dependencies: { values: DependencyGroup[] };
 }
 
+export type ConfigFormat = "properties" | "yml";
+
 export interface ProjectConfig {
   type: string;
   language: string;
@@ -47,6 +49,10 @@ export interface ProjectConfig {
   packaging: string;
   version: string;
   dependencies: string[];
+  /** Format of the generated application config file. */
+  configFormat: ConfigFormat;
+  /** Extra entries applied to the config file, as "key=value" strings. */
+  properties: string[];
 }
 
 export class InitializrError extends Error {

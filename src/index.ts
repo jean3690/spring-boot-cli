@@ -10,6 +10,7 @@ import {
   generateProject,
 } from "./api/initializr.js";
 import { buildConfig, type CliFlags } from "./prompts/config.js";
+import { applyAppProperties, parsePropertyLine, type PropertyEntry } from "./properties.js";
 import { unzipToDir } from "./writer.js";
 import { detectBuildTool, runProject } from "./runner.js";
 import {
@@ -35,6 +36,11 @@ interface CreateOptions extends CliFlags {
   package?: string;
 }
 
+/** Commander reducer for repeatable options (--set a=1 --set b=2). */
+function collect(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
 async function main(): Promise<void> {
   const program = new Command();
 
@@ -46,7 +52,7 @@ async function main(): Promise<void> {
   program
     .command("create", { isDefault: true })
     .description("Scaffold a Spring Boot project, interactively or via flags.")
-    .argument("[dir]", "target directory (default: current directory)", ".")
+    .argument("[dir]", "target directory (default: current directory)")
     .option("--type <id>", "project type: maven-project | gradle-project | gradle-project-kotlin")
     .option("--language <lang>", "language: java | kotlin | groovy")
     .option("--boot <version>", "Spring Boot version, e.g. 4.1.1")
@@ -58,6 +64,8 @@ async function main(): Promise<void> {
     .option("--package <name>", "base package name, e.g. com.example.demo")
     .option("--packaging <type>", "packaging: jar | war")
     .option("-d, --deps <list>", "dependencies (comma separated id or name). Providing this enables non-interactive mode")
+    .option("--config-format <fmt>", "config file format: properties | yml (default: properties)")
+    .option("--set <key=value>", "set an entry in the config file (repeatable)", collect, [])
     .option("-f, --force", "allow generating into a non-empty directory without confirmation")
     .option("--module <name>", "workspace module name to register (defaults to artifact id)")
     .option("--run", "run the project immediately after generating")
@@ -99,11 +107,47 @@ async function main(): Promise<void> {
   await program.parseAsync();
 }
 
-async function createCmd(dir: string, options: CreateOptions): Promise<void> {
+async function createCmd(dir: string | undefined, options: CreateOptions): Promise<void> {
   console.log(BANNER);
   p.intro(pc.cyan("Let's create a Spring Boot project"));
 
-  const targetDir = resolve(process.cwd(), dir);
+  const nonInteractive = Boolean(options.deps);
+
+  // Resolve the target directory: CLI arg wins, otherwise ask interactively
+  // (or fall back to the current directory in non-interactive mode).
+  let targetDirInput = dir;
+  if (!targetDirInput) {
+    if (nonInteractive) {
+      targetDirInput = ".";
+    } else if (process.stdin.isTTY) {
+      const name = await p.text({
+        message: "Project directory (new folder for the project)",
+        placeholder: "my-app",
+        validate: (v) => {
+          const value = (v ?? "").trim();
+          if (!value) return "Directory name is required";
+          if (value.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(value)) {
+            return "Use a relative path (e.g. my-app or services/user-service)";
+          }
+          return undefined;
+        },
+      });
+      if (p.isCancel(name)) {
+        p.cancel("Operation cancelled.");
+        process.exit(0);
+      }
+      targetDirInput = name.trim();
+    } else {
+      p.outro(
+        pc.red(
+          "Interactive mode requires a TTY. Pass a directory and -d/--deps (e.g. `sbc create my-app -d web`) to run non-interactively.",
+        ),
+      );
+      process.exit(1);
+    }
+  }
+
+  const targetDir = resolve(process.cwd(), targetDirInput);
 
   // Directory check.
   let existing: string[];
@@ -137,7 +181,6 @@ async function createCmd(dir: string, options: CreateOptions): Promise<void> {
     fail(err);
   }
 
-  const nonInteractive = Boolean(options.deps);
   if (nonInteractive) {
     p.log.info("Dependencies provided via --deps, running non-interactively.");
   } else if (!process.stdin.isTTY) {
@@ -161,6 +204,8 @@ async function createCmd(dir: string, options: CreateOptions): Promise<void> {
     packageName: options.package,
     packaging: options.packaging,
     deps: options.deps,
+    configFormat: options.configFormat,
+    set: options.set,
   };
   const config = await buildConfig(metadata, flags, nonInteractive);
 
@@ -174,6 +219,9 @@ async function createCmd(dir: string, options: CreateOptions): Promise<void> {
     `Package:      ${config.packageName}`,
     `Packaging:    ${config.packaging}`,
     `Dependencies: ${config.dependencies.length ? config.dependencies.join(", ") : "(none)"}`,
+    `Config:       ${config.configFormat === "yml" ? "application.yml" : "application.properties"}${
+      config.properties.length ? ` (+${config.properties.length} entries)` : ""
+    }`,
   ].join("\n");
   p.note(summary, "Project configuration");
 
@@ -181,6 +229,10 @@ async function createCmd(dir: string, options: CreateOptions): Promise<void> {
   try {
     const zip = await generateProject(config);
     const fileCount = await unzipToDir(zip, targetDir);
+    const entries = config.properties
+      .map(parsePropertyLine)
+      .filter((e): e is PropertyEntry => e !== null);
+    await applyAppProperties(targetDir, config.configFormat, entries);
     spinner.stop(pc.green(`Done! ${fileCount} files written to ${targetDir}`));
   } catch (err) {
     spinner.stop(pc.red("Generation failed."));
@@ -217,7 +269,7 @@ async function createCmd(dir: string, options: CreateOptions): Promise<void> {
       pc.green("Project created successfully!"),
       "",
       "Next steps:",
-      `  ${pc.cyan(`cd ${dir}`)}`,
+      `  ${pc.cyan(`cd ${targetDirInput}`)}`,
       `  ${pc.cyan(runHint)}`,
       workspace ? `  ${pc.cyan(`sbc run ${options.module ?? config.artifactId}`)}  ${pc.dim("(from anywhere in the workspace)")}` : "",
     ]
