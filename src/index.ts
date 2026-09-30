@@ -2,13 +2,15 @@ import { Command } from "commander";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { access, readdir } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   InitializrError,
   fetchMetadata,
   searchDependencies,
   generateProject,
   findUnsupportedValues,
+  type InitializrMetadata,
+  type ProjectConfig,
 } from "./api/initializr.js";
 import {
   REGISTRIES,
@@ -16,11 +18,13 @@ import {
   resolveRegistry,
   type Registry,
 } from "./api/registry.js";
-import { buildConfig, type CliFlags } from "./prompts/config.js";
+import { buildConfig, buildMonorepoConfig, type CliFlags, type MonorepoConfig } from "./prompts/config.js";
 import { applyAppProperties, parsePropertyLine, type PropertyEntry } from "./properties.js";
 import { unzipToDir } from "./writer.js";
 import { detectBuildTool, runProject } from "./runner.js";
 import { assertSettableRegistry, loadConfig, resolveRegistryFor, writeConfig } from "./config.js";
+import { scaffoldMonorepo } from "./scaffold.js";
+import { sanitizeArtifactId } from "./validate.js";
 import {
   findModule,
   initWorkspace,
@@ -29,6 +33,8 @@ import {
   registerModule,
   toModulePath,
   writeWorkspace,
+  type Workspace,
+  type WorkspaceModule,
 } from "./workspace.js";
 
 const BANNER = pc.cyan(`
@@ -77,6 +83,7 @@ async function main(): Promise<void> {
     .option("--package <name>", "base package name, e.g. com.example.demo")
     .option("--packaging <type>", "packaging: jar | war")
     .option("-d, --deps <list>", "dependencies (comma separated id or name). Providing this enables non-interactive mode")
+    .option("--modules <list>", "create a monorepo: `api,core` or `api:web;core:jdbc,data-jpa` (implies a parent aggregator)")
     .option("--config-format <fmt>", "config file format: properties | yml (default: properties)")
     .option("--set <key=value>", "set an entry in the config file (repeatable)", collect, [])
     .option("-f, --force", "allow generating into a non-empty directory without confirmation")
@@ -140,14 +147,65 @@ async function main(): Promise<void> {
   await program.parseAsync();
 }
 
+/** How the generated project is laid out on disk. */
+type Layout = "single" | "monorepo";
+
 async function createCmd(dir: string | undefined, options: CreateOptions): Promise<void> {
   console.log(BANNER);
   p.intro(pc.cyan("Let's create a Spring Boot project"));
 
-  const nonInteractive = Boolean(options.deps);
+  // --deps and --modules are the scripting escape hatches: either one means the
+  // caller wants defaults for everything they did not spell out.
+  const nonInteractive = Boolean(options.deps || options.modules);
 
-  // Resolve the target directory: CLI arg wins, otherwise ask interactively
-  // (or fall back to the current directory in non-interactive mode).
+  const targetDir = await resolveTargetDir(dir, nonInteractive, options);
+  const registry = await pickRegistry(options.registry, targetDir, nonInteractive);
+
+  const spinner = p.spinner();
+  spinner.start(`Fetching available versions and dependencies from ${registry.name}...`);
+  let metadata: InitializrMetadata;
+  try {
+    metadata = await fetchMetadata(registry);
+    spinner.stop("Metadata loaded.");
+  } catch (err) {
+    spinner.stop(pc.red("Failed to load metadata."));
+    fail(err);
+  }
+
+  if (nonInteractive) {
+    p.log.info(
+      options.modules
+        ? "Modules provided via --modules, running non-interactively."
+        : "Dependencies provided via --deps, running non-interactively.",
+    );
+  } else if (!process.stdin.isTTY) {
+    p.outro(
+      pc.red(
+        "Interactive mode requires a TTY. Pass -d/--deps (e.g. -d web,data-jpa) to run non-interactively.",
+      ),
+    );
+    process.exit(1);
+  }
+
+  const layout = await pickLayout(options, nonInteractive);
+  const flags = toCliFlags(options);
+
+  if (layout === "monorepo") {
+    await createMonorepo(targetDir, metadata, registry, flags, options, nonInteractive);
+  } else {
+    await createSingle(targetDir, metadata, registry, flags, options, nonInteractive);
+  }
+}
+
+/**
+ * Resolve and validate the target directory, asking for it when omitted.
+ * An existing non-empty directory needs --force or an explicit confirmation.
+ */
+async function resolveTargetDir(
+  dir: string | undefined,
+  nonInteractive: boolean,
+  options: CreateOptions,
+): Promise<string> {
   let targetDirInput = dir;
   if (!targetDirInput) {
     if (nonInteractive) {
@@ -182,7 +240,6 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
 
   const targetDir = resolve(process.cwd(), targetDirInput);
 
-  // Directory check.
   let existing: string[];
   try {
     existing = await readdir(targetDir);
@@ -203,31 +260,42 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
     }
   }
 
-  const registry = await pickRegistry(options.registry, targetDir, nonInteractive);
+  return targetDir;
+}
 
-  const spinner = p.spinner();
-  spinner.start(`Fetching available versions and dependencies from ${registry.name}...`);
-  let metadata;
-  try {
-    metadata = await fetchMetadata(registry);
-    spinner.stop("Metadata loaded.");
-  } catch (err) {
-    spinner.stop(pc.red("Failed to load metadata."));
-    fail(err);
+/**
+ * Single project or multi-module reactor. `--modules` forces a monorepo;
+ * otherwise the choice is asked once, defaulting to a single project.
+ */
+async function pickLayout(options: CreateOptions, nonInteractive: boolean): Promise<Layout> {
+  if (options.modules) return "monorepo";
+  if (nonInteractive || !process.stdin.isTTY) return "single";
+
+  const picked = await p.select<Layout>({
+    message: "Project layout",
+    initialValue: "single",
+    options: [
+      {
+        value: "single",
+        label: "Single project",
+        hint: "One standalone Spring Boot application",
+      },
+      {
+        value: "monorepo",
+        label: "Monorepo (multi-module build)",
+        hint: "A parent aggregator with several modules, built by one command",
+      },
+    ],
+  });
+  if (p.isCancel(picked)) {
+    p.cancel("Operation cancelled.");
+    process.exit(0);
   }
+  return picked;
+}
 
-  if (nonInteractive) {
-    p.log.info("Dependencies provided via --deps, running non-interactively.");
-  } else if (!process.stdin.isTTY) {
-    p.outro(
-      pc.red(
-        "Interactive mode requires a TTY. Pass -d/--deps (e.g. -d web,data-jpa) to run non-interactively.",
-      ),
-    );
-    process.exit(1);
-  }
-
-  const flags: CliFlags = {
+function toCliFlags(options: CreateOptions): CliFlags {
+  return {
     type: options.type,
     language: options.language,
     boot: options.boot,
@@ -239,40 +307,77 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
     packageName: options.package,
     packaging: options.packaging,
     deps: options.deps,
+    modules: options.modules,
     configFormat: options.configFormat,
     set: options.set,
   };
-  const config = await buildConfig(metadata, flags, nonInteractive);
+}
 
+/**
+ * Warn about values the registry does not advertise in its metadata.
+ *
+ * A monorepo checks the same shared values once per module, so warnings are
+ * deduplicated by message rather than repeated N times.
+ */
+function warnUnsupported(metadata: InitializrMetadata, configs: ProjectConfig[]): void {
   // start.aliyun.com accepts values it does not support and echoes them into the
   // generated build file, so surface mismatches against its metadata early.
-  for (const warning of findUnsupportedValues([
-    { field: "Project type", section: metadata.type, value: config.type },
-    { field: "Language", section: metadata.language, value: config.language },
-    { field: "Boot version", section: metadata.bootVersion, value: config.bootVersion },
-    { field: "Java version", section: metadata.javaVersion, value: config.javaVersion },
-    { field: "Packaging", section: metadata.packaging, value: config.packaging },
-  ])) {
-    p.log.warn(`${warning} — the generated project may not build.`);
+  const seen = new Set<string>();
+  for (const config of configs) {
+    for (const warning of findUnsupportedValues([
+      { field: "Project type", section: metadata.type, value: config.type },
+      { field: "Language", section: metadata.language, value: config.language },
+      { field: "Boot version", section: metadata.bootVersion, value: config.bootVersion },
+      { field: "Java version", section: metadata.javaVersion, value: config.javaVersion },
+      { field: "Packaging", section: metadata.packaging, value: config.packaging },
+    ])) {
+      if (seen.has(warning)) continue;
+      seen.add(warning);
+      p.log.warn(`${warning} — the generated project may not build.`);
+    }
   }
+}
 
-  const summary = [
-    `Registry:     ${registry.name}`,
-    `Build tool:   ${config.type}`,
-    `Language:     ${config.language}`,
-    `Boot version: ${config.bootVersion}`,
-    `Java:         ${config.javaVersion}`,
-    `Group:        ${config.groupId}`,
-    `Artifact:     ${config.artifactId}`,
-    `Package:      ${config.packageName}`,
-    `Packaging:    ${config.packaging}`,
-    `Dependencies: ${config.dependencies.length ? config.dependencies.join(", ") : "(none)"}`,
-    `Config:       ${config.configFormat === "yml" ? "application.yml" : "application.properties"}${
-      config.properties.length ? ` (+${config.properties.length} entries)` : ""
-    }`,
-  ].join("\n");
-  p.note(summary, "Project configuration");
+/** Render a label/value block with the values aligned in one column. */
+function summaryLines(entries: Array<[string, string]>): string {
+  const width = Math.max(...entries.map(([label]) => label.length));
+  return entries.map(([label, value]) => `${label.padEnd(width)}  ${value}`).join("\n");
+}
 
+async function createSingle(
+  targetDir: string,
+  metadata: InitializrMetadata,
+  registry: Registry,
+  flags: CliFlags,
+  options: CreateOptions,
+  nonInteractive: boolean,
+): Promise<void> {
+  const config = await buildConfig(metadata, flags, nonInteractive);
+  warnUnsupported(metadata, [config]);
+
+  p.note(
+    summaryLines([
+      ["Registry", registry.name],
+      ["Build tool", config.type],
+      ["Language", config.language],
+      ["Boot version", config.bootVersion],
+      ["Java", config.javaVersion],
+      ["Group", config.groupId],
+      ["Artifact", config.artifactId],
+      ["Package", config.packageName],
+      ["Packaging", config.packaging],
+      ["Dependencies", config.dependencies.length ? config.dependencies.join(", ") : "(none)"],
+      [
+        "Config",
+        `${config.configFormat === "yml" ? "application.yml" : "application.properties"}${
+          config.properties.length ? ` (+${config.properties.length} entries)` : ""
+        }`,
+      ],
+    ]),
+    "Project configuration",
+  );
+
+  const spinner = p.spinner();
   spinner.start(`Generating project from ${registry.name}...`);
   try {
     const zip = await generateProject(config, registry);
@@ -289,18 +394,16 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
 
   // Register the module if we generated inside a monorepo workspace.
   const workspace = await loadWorkspace(targetDir);
+  let moduleName: string | undefined;
   if (workspace) {
-    const relPath = toModulePath(workspace.root, targetDir) || ".";
-    const moduleName = options.module ?? config.artifactId;
-    registerModule(workspace, {
+    moduleName = options.module ?? config.artifactId;
+    await registerInWorkspace(workspace, {
       name: moduleName,
-      path: relPath,
+      path: toModulePath(workspace.root, targetDir) || ".",
       type: config.type,
       language: config.language,
       bootVersion: config.bootVersion,
     });
-    await writeWorkspace(workspace);
-    p.log.info(`Registered module ${pc.cyan(moduleName)} in workspace ${workspace.root}`);
   }
 
   // Not every registry ships a build wrapper (start.aliyun.com has no mvnw),
@@ -320,18 +423,164 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
     return;
   }
 
+  const cdHint = relative(process.cwd(), targetDir) || ".";
   p.outro(
     [
       pc.green("Project created successfully!"),
       "",
       "Next steps:",
-      `  ${pc.cyan(`cd ${targetDirInput}`)}`,
+      `  ${pc.cyan(`cd ${cdHint}`)}`,
       `  ${pc.cyan(runHint)}`,
-      workspace ? `  ${pc.cyan(`sbc run ${options.module ?? config.artifactId}`)}  ${pc.dim("(from anywhere in the workspace)")}` : "",
+      workspace ? `  ${pc.cyan(`sbc run ${moduleName}`)}  ${pc.dim("(from anywhere in the workspace)")}` : "",
     ]
       .filter(Boolean)
       .join("\n"),
   );
+}
+
+async function createMonorepo(
+  targetDir: string,
+  metadata: InitializrMetadata,
+  registry: Registry,
+  flags: CliFlags,
+  options: CreateOptions,
+  nonInteractive: boolean,
+): Promise<void> {
+  // The root artifact id defaults to the directory name, which is what the
+  // user is looking at when they run the command. An unsanitizable name falls
+  // through to the prompt / built-in default.
+  const fromDir = sanitizeArtifactId(basename(targetDir));
+  const planFlags: CliFlags = {
+    ...flags,
+    ...(options.artifact || fromDir ? { artifact: options.artifact ?? fromDir } : {}),
+  };
+
+  let plan: MonorepoConfig;
+  try {
+    plan = await buildMonorepoConfig(metadata, planFlags, nonInteractive);
+  } catch (err) {
+    fail(err);
+  }
+
+  const { parent, modules } = plan;
+  const first = modules[0]!;
+
+  warnUnsupported(
+    metadata,
+    modules.map((m) => m.config),
+  );
+
+  p.note(
+    [
+      summaryLines([
+        ["Registry", registry.name],
+        ["Build tool", first.config.type],
+        ["Language", first.config.language],
+        ["Boot version", first.config.bootVersion],
+        ["Java", first.config.javaVersion],
+        ["Group", parent.groupId],
+        ["Root artifact", parent.artifactId],
+        ["Version", parent.version],
+        [
+          "Config",
+          `${plan.configFormat === "yml" ? "application.yml" : "application.properties"}${
+            plan.properties.length ? ` (+${plan.properties.length} entries)` : ""
+          }`,
+        ],
+      ]),
+      "",
+      renderModuleTable(modules),
+    ].join("\n"),
+    "Monorepo configuration",
+  );
+
+  const spinner = p.spinner();
+  const total = modules.length;
+  let result;
+  try {
+    result = await scaffoldMonorepo(plan, registry, targetDir, {
+      onModuleStart: (index, count, spec) =>
+        spinner.start(`Generating module ${index + 1}/${count}: ${spec.path}...`),
+      onModuleDone: (index, count) =>
+        spinner.stop(pc.green(`Module ${index + 1}/${count} generated.`)),
+    });
+  } catch (err) {
+    spinner.stop(pc.red("Generation failed."));
+    fail(err);
+  }
+
+  const tool = result.tool;
+  const { workspace } = await initWorkspace(targetDir);
+  workspace.manifest.root = {
+    artifactId: parent.artifactId,
+    type: first.config.type,
+    bootVersion: parent.bootVersion,
+  };
+  for (const { spec, config } of modules) {
+    const entry: WorkspaceModule = {
+      name: spec.artifactId,
+      path: spec.path,
+      type: config.type,
+      language: config.language,
+      bootVersion: config.bootVersion,
+      parent: parent.artifactId,
+    };
+    registerModule(workspace, entry);
+  }
+  await writeWorkspace(workspace);
+  p.log.info(
+    `Registered ${pc.cyan(String(total))} module(s) in workspace ${pc.dim(workspace.root)}`,
+  );
+
+  const firstSpec = modules[0]!.spec;
+  const runHint =
+    tool === "maven"
+      ? `./mvnw -pl ${firstSpec.path} spring-boot:run`
+      : `./gradlew :${firstSpec.path.replace(/\//g, ":")}:bootRun`;
+  const buildHint = tool === "maven" ? "./mvnw install -DskipTests" : "./gradlew build";
+  const cdHint = relative(process.cwd(), targetDir) || ".";
+
+  if (options.run) {
+    p.outro(pc.green("Monorepo created — starting the first module now."));
+    await runAndExit(result.moduleDirs[0]!);
+    return;
+  }
+
+  p.outro(
+    [
+      pc.green(`Monorepo created successfully — ${total} module(s), ${result.fileCount} files.`),
+      "",
+      "Next steps:",
+      `  ${pc.cyan(`cd ${cdHint}`)}`,
+      `  ${pc.cyan(buildHint)}  ${pc.dim("(build every module)")}`,
+      `  ${pc.cyan(runHint)}  ${pc.dim("(run the first module)")}`,
+      `  ${pc.cyan("sbc list")}  ${pc.dim("(see every module)")}`,
+    ].join("\n"),
+  );
+}
+
+/** Render the module list as an aligned table for the confirmation note. */
+function renderModuleTable(modules: MonorepoConfig["modules"]): string {
+  const width = modules.reduce((w, m) => Math.max(w, m.spec.path.length), 0);
+  return [
+    `Modules (${modules.length}):`,
+    ...modules.map(
+      ({ spec, config }) =>
+        `  ${pc.cyan(spec.path.padEnd(width))}  ${pc.dim(
+          config.dependencies.length ? config.dependencies.join(", ") : "(no dependencies)",
+        )}`,
+    ),
+  ].join("\n");
+}
+
+/** Add a module to the workspace manifest and persist it. */
+async function registerInWorkspace(
+  workspace: Workspace,
+  module: WorkspaceModule,
+): Promise<void> {
+  registerModule(workspace, module);
+  await writeWorkspace(workspace);
+  p.log.info(`Registered module ${pc.cyan(module.name)} in workspace ${workspace.root}`);
 }
 
 async function runCmd(
@@ -467,15 +716,22 @@ async function listCmd(): Promise<void> {
     return;
   }
 
-  const { modules } = workspace.manifest;
+  const { modules, root } = workspace.manifest;
   console.log(pc.dim(`Workspace: ${workspace.root}`));
+  if (root) {
+    console.log(
+      pc.dim(
+        `Aggregator: ${root.artifactId} · ${root.type} · Boot ${root.bootVersion} · ${modules.length} module(s)`,
+      ),
+    );
+  }
   if (modules.length === 0) {
     console.log(pc.yellow("No modules registered yet. Create one with: sbc create <dir>"));
     return;
   }
 
   const nameWidth = modules.reduce((w, m) => Math.max(w, m.name.length), 0);
-  console.log(pc.dim(`${modules.length} module(s):\n`));
+  console.log(pc.dim(`\n${modules.length} module(s):\n`));
   for (const m of modules) {
     const built = (await detectBuildTool(moduleDir(workspace, m))) ?? "?";
     console.log(

@@ -182,6 +182,17 @@ export function usesLegacyReleaseSuffix(version: string): boolean {
   return minor < 4;
 }
 
+/**
+ * The Boot version in the form that exists on Maven Central. A registry's
+ * metadata may advertise "4.1.1.RELEASE" while the published artifact is
+ * "4.1.1", so every coordinate written into a build file goes through here.
+ */
+export function normalizeBootVersion(version: string): string {
+  return usesLegacyReleaseSuffix(version)
+    ? ensureReleaseSuffix(version)
+    : version.replace(/\.RELEASE$/, "");
+}
+
 export interface DependencyMatch {
   group: string;
   dep: Dependency;
@@ -257,9 +268,7 @@ export async function generateProject(
 ): Promise<ArrayBuffer> {
   // Use whichever form of the version actually exists on Maven Central, so the
   // generated build file pins a resolvable BOM on both legacy and modern Boot.
-  const bootVersion = usesLegacyReleaseSuffix(config.bootVersion)
-    ? ensureReleaseSuffix(config.bootVersion)
-    : config.bootVersion.replace(/\.RELEASE$/, "");
+  const bootVersion = normalizeBootVersion(config.bootVersion);
   const body = new URLSearchParams({
     type: config.type,
     dependencies: config.dependencies.join(","),

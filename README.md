@@ -12,9 +12,10 @@ A `vue-cli` style interactive CLI to **scaffold, search and run** Spring Boot pr
 ## Features
 
 - **Scaffold** projects interactively (prompts) or non-interactively (flags), just like `vue-cli`.
+- **Monorepo** support: `--modules` scaffolds a real multi-module reactor — one aggregator, one wrapper, one command builds every module.
 - **Search / filter** dependencies by id, name or description — from the command line or a type-to-filter picker.
 - **Run** a generated project through its Maven/Gradle wrapper (`spring-boot:run` / `bootRun`).
-- **Monorepo** support: track multiple Spring Boot modules under one workspace and run any of them by name.
+- **Workspace** manifest so `sbc list` / `sbc run <module>` work across a tree of projects.
 - **Multiple registries** — switch between start.spring.io and start.aliyun.com per command, per project, or via an environment variable.
 
 ## Install
@@ -33,8 +34,11 @@ npx @jeangrey/sbc
 # Interactive
 sbc create my-app
 
-# Non-interactive (any provided --deps enables non-interactive mode)
+# Non-interactive (any provided --deps or --modules enables non-interactive mode)
 sbc create my-app --type maven-project --java 21 --group com.example -d web,data-jpa
+
+# Generate a multi-module reactor instead of a single project
+sbc create shop --modules api,core,web -d web
 
 # Generate and run immediately
 sbc create my-app -d web --run
@@ -45,13 +49,17 @@ Key options:
 | Option | Description |
 | --- | --- |
 | `--type <id>` | `maven-project` \| `gradle-project` \| `gradle-project-kotlin` |
+| `--modules <list>` | Build a monorepo: `api,core,web` or `api:web;core:jdbc,data-jpa` |
 | `--language <lang>` | `java` \| `kotlin` \| `groovy` |
 | `--boot <version>` | Spring Boot version, e.g. `3.5.0` |
 | `--java <version>` | Java version, e.g. `21` |
-| `--group` / `--artifact` | Maven coordinates |
+| `--group` / `--artifact` | Maven coordinates (`--artifact` is the root artifact in a monorepo) |
+| `--name` / `--description` | Project name and description |
 | `--package <name>` | Base package, e.g. `com.example.demo` |
 | `--packaging <type>` | `jar` \| `war` |
 | `-d, --deps <list>` | Comma-separated dependency ids or names |
+| `--config-format <fmt>` | `properties` \| `yml` |
+| `--set <key=value>` | Add an entry to the config file (repeatable) |
 | `-f, --force` | Write into a non-empty directory |
 | `--run` | Run the project after generating |
 | `--module <name>` | Workspace module name to register |
@@ -137,28 +145,89 @@ sbc run my-app
 sbc run my-app -- --debug
 ```
 
-### Monorepo workspace
+### Monorepo (multi-module build)
+
+`sbc create --modules` generates a real build reactor, not a folder of unrelated
+projects: an aggregator at the root owns the build, every module inherits from
+it, and one `./mvnw` / `./gradlew` builds the whole tree.
 
 ```bash
-# 1. Create a workspace manifest at the monorepo root
-sbc workspace init
+# Interactive — pick "Monorepo" when asked for the layout, then add modules
+sbc create shop
 
-# 2. Scaffold modules — each is auto-registered in sbc.workspace.json
+# Non-interactive: flat modules, all sharing --deps
+sbc create shop --modules api,core,web -d web
+
+# Nested paths and per-module dependencies
+sbc create shop --modules "api:web,data-jpa;services/gateway:web;core"
+
+# Gradle works the same way
+sbc create shop --modules api,web --type gradle-project
+```
+
+The result is a single reactor:
+
+```
+shop/
+├── pom.xml          # <packaging>pom</packaging> + <modules>
+├── mvnw             # one wrapper for the whole tree
+├── sbc.workspace.json
+├── api/
+│   ├── pom.xml      # <parent> → ../pom.xml
+│   └── src/main/java/com/example/api/ApiApplication.java
+├── core/
+│   └── pom.xml      # <parent> → ../pom.xml
+└── services/gateway/
+    └── pom.xml      # <parent> → ../../pom.xml
+```
+
+Modules share the build tool, language, Boot version, Java version and group id;
+they differ in artifact id, package and dependencies. Bump the Boot version once
+in the root `pom.xml` and every module follows.
+
+```bash
+cd shop
+./mvnw install -DskipTests            # build every module
+./mvnw -pl api spring-boot:run        # run one module
+sbc list                              # list modules
+sbc run api                           # same thing, from anywhere
+```
+
+Gradle roots get `settings.gradle` (or `.kts`) with an `include` per module, and
+module build files read their `group`/`version` from `rootProject`.
+
+### Workspace
+
+A workspace is any directory with an `sbc.workspace.json` manifest. `sbc create`
+maintains it for you — a monorepo writes it at its root, and standalone projects
+are auto-registered in an enclosing one:
+
+```bash
+# Track independently built projects under one root
+sbc workspace init
 sbc create services/user-service -d web,data-jpa
 sbc create apps/api-gateway --type gradle-project -d web
 
-# 3. Inspect and run modules from anywhere in the workspace
 sbc list
 sbc run user-service
 ```
 
-`sbc.workspace.json` records each module's name, path, build type, language and Boot version:
+The manifest records the aggregator (when the root is a reactor) and each
+module's name, path, build type, language, Boot version and parent:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "root": { "artifactId": "shop", "type": "maven-project", "bootVersion": "4.1.1" },
   "modules": [
-    { "name": "user-service", "path": "services/user-service", "type": "maven-project", "language": "java", "bootVersion": "3.5.0" }
+    {
+      "name": "api",
+      "path": "services/api",
+      "type": "maven-project",
+      "language": "java",
+      "bootVersion": "4.1.1",
+      "parent": "shop"
+    }
   ]
 }
 ```

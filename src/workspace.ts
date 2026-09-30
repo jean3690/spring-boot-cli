@@ -7,7 +7,7 @@ import { access, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 export const WORKSPACE_FILE = "sbc.workspace.json";
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
 
 export interface WorkspaceModule {
   /** Unique, human-facing module name (defaults to the artifact id). */
@@ -18,10 +18,26 @@ export interface WorkspaceModule {
   type: string;
   language: string;
   bootVersion: string;
+  /**
+   * Artifact id of the aggregator this module inherits from. Absent for a
+   * standalone project that is not part of a multi-module build.
+   */
+  parent?: string;
+}
+
+/** The aggregator of a multi-module build, when the workspace root is a reactor. */
+export interface WorkspaceRoot {
+  /** Artifact id of the aggregator (the root pom / root project). */
+  artifactId: string;
+  /** Initializr project type the modules share, e.g. "maven-project". */
+  type: string;
+  bootVersion: string;
 }
 
 export interface WorkspaceManifest {
   version: number;
+  /** Set when the workspace root is itself a multi-module aggregator. */
+  root?: WorkspaceRoot;
   modules: WorkspaceModule[];
 }
 
@@ -55,7 +71,9 @@ export async function readWorkspace(root: string): Promise<Workspace> {
   const raw = await readFile(join(root, WORKSPACE_FILE), "utf8");
   const parsed = JSON.parse(raw) as Partial<WorkspaceManifest>;
   const manifest: WorkspaceManifest = {
+    // Older manifests (v1) have no aggregator block; they still load as-is.
     version: parsed.version ?? MANIFEST_VERSION,
+    ...(parsed.root ? { root: parsed.root } : {}),
     modules: Array.isArray(parsed.modules) ? parsed.modules : [],
   };
   return { root: resolve(root), manifest };
