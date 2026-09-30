@@ -1,18 +1,26 @@
 import { Command } from "commander";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { readdir } from "node:fs/promises";
-import { resolve } from "node:path";
+import { access, readdir } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import {
   InitializrError,
   fetchMetadata,
   searchDependencies,
   generateProject,
+  findUnsupportedValues,
 } from "./api/initializr.js";
+import {
+  REGISTRIES,
+  UnknownRegistryError,
+  resolveRegistry,
+  type Registry,
+} from "./api/registry.js";
 import { buildConfig, type CliFlags } from "./prompts/config.js";
 import { applyAppProperties, parsePropertyLine, type PropertyEntry } from "./properties.js";
 import { unzipToDir } from "./writer.js";
 import { detectBuildTool, runProject } from "./runner.js";
+import { assertSettableRegistry, loadConfig, resolveRegistryFor, writeConfig } from "./config.js";
 import {
   findModule,
   initWorkspace,
@@ -26,7 +34,7 @@ import {
 const BANNER = pc.cyan(`
   ╭──────────────────────────────────────╮
   │            sbc  ·  Spring Boot       │
-  │   powered by start.spring.io         │
+  │   start.spring.io / start.aliyun.com │
   ╰──────────────────────────────────────╯`);
 
 interface CreateOptions extends CliFlags {
@@ -34,6 +42,11 @@ interface CreateOptions extends CliFlags {
   run?: boolean;
   module?: string;
   package?: string;
+  registry?: string;
+}
+
+interface RegistryOptions {
+  registry?: string;
 }
 
 /** Commander reducer for repeatable options (--set a=1 --set b=2). */
@@ -68,6 +81,7 @@ async function main(): Promise<void> {
     .option("--set <key=value>", "set an entry in the config file (repeatable)", collect, [])
     .option("-f, --force", "allow generating into a non-empty directory without confirmation")
     .option("--module <name>", "workspace module name to register (defaults to artifact id)")
+    .option("--registry <id>", "Initializr registry: spring | aliyun, or a full URL (default: spring)")
     .option("--run", "run the project immediately after generating")
     .action(createCmd);
 
@@ -84,12 +98,31 @@ async function main(): Promise<void> {
     .command("search")
     .description("Search available Spring Boot dependencies by id, name or description.")
     .argument("<query...>", "search terms")
+    .option("--registry <id>", "Initializr registry: spring | aliyun, or a full URL (default: spring)")
     .action(searchCmd);
 
   program
     .command("list")
     .description("List the Spring Boot modules registered in the enclosing workspace.")
     .action(listCmd);
+
+  const config = program
+    .command("config")
+    .description("Show or edit the sbc configuration (sbc.config.json).");
+  config
+    .command("show", { isDefault: true })
+    .description("Print the resolved configuration and the file it came from.")
+    .action(configShowCmd);
+  config
+    .command("set")
+    .description("Set a configuration value, e.g. `sbc config set registry aliyun`.")
+    .argument("<key>", "configuration key (registry)")
+    .argument("<value>", "value to store")
+    .action(configSetCmd);
+  config
+    .command("path")
+    .description("Print the path of the nearest sbc.config.json.")
+    .action(configPathCmd);
 
   const workspace = program
     .command("workspace")
@@ -170,11 +203,13 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
     }
   }
 
+  const registry = await pickRegistry(options.registry, targetDir, nonInteractive);
+
   const spinner = p.spinner();
-  spinner.start("Fetching available versions and dependencies from start.spring.io...");
+  spinner.start(`Fetching available versions and dependencies from ${registry.name}...`);
   let metadata;
   try {
-    metadata = await fetchMetadata();
+    metadata = await fetchMetadata(registry);
     spinner.stop("Metadata loaded.");
   } catch (err) {
     spinner.stop(pc.red("Failed to load metadata."));
@@ -209,7 +244,20 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
   };
   const config = await buildConfig(metadata, flags, nonInteractive);
 
+  // start.aliyun.com accepts values it does not support and echoes them into the
+  // generated build file, so surface mismatches against its metadata early.
+  for (const warning of findUnsupportedValues([
+    { field: "Project type", section: metadata.type, value: config.type },
+    { field: "Language", section: metadata.language, value: config.language },
+    { field: "Boot version", section: metadata.bootVersion, value: config.bootVersion },
+    { field: "Java version", section: metadata.javaVersion, value: config.javaVersion },
+    { field: "Packaging", section: metadata.packaging, value: config.packaging },
+  ])) {
+    p.log.warn(`${warning} — the generated project may not build.`);
+  }
+
   const summary = [
+    `Registry:     ${registry.name}`,
     `Build tool:   ${config.type}`,
     `Language:     ${config.language}`,
     `Boot version: ${config.bootVersion}`,
@@ -225,9 +273,9 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
   ].join("\n");
   p.note(summary, "Project configuration");
 
-  spinner.start("Generating project...");
+  spinner.start(`Generating project from ${registry.name}...`);
   try {
-    const zip = await generateProject(config);
+    const zip = await generateProject(config, registry);
     const fileCount = await unzipToDir(zip, targetDir);
     const entries = config.properties
       .map(parsePropertyLine)
@@ -255,8 +303,16 @@ async function createCmd(dir: string | undefined, options: CreateOptions): Promi
     p.log.info(`Registered module ${pc.cyan(moduleName)} in workspace ${workspace.root}`);
   }
 
+  // Not every registry ships a build wrapper (start.aliyun.com has no mvnw),
+  // so only suggest the wrapper when it is actually present.
   const isMaven = config.type.startsWith("maven");
-  const runHint = isMaven ? "./mvnw spring-boot:run" : "./gradlew bootRun";
+  const hasWrapper = await access(join(targetDir, isMaven ? "mvnw" : "gradlew")).then(
+    () => true,
+    () => false,
+  );
+  const wrapperCmd = isMaven ? "./mvnw" : "./gradlew";
+  const globalCmd = isMaven ? "mvn" : "gradle";
+  const runHint = `${hasWrapper ? wrapperCmd : globalCmd} ${isMaven ? "spring-boot:run" : "bootRun"}`;
 
   if (options.run) {
     p.outro(pc.green("Project created — starting it now."));
@@ -316,10 +372,17 @@ async function runAndExit(dir: string, extraArgs: string[] = []): Promise<void> 
   }
 }
 
-async function searchCmd(query: string[]): Promise<void> {
+async function searchCmd(query: string[], options: RegistryOptions): Promise<void> {
+  let registry: Registry;
+  try {
+    registry = await pickRegistry(options.registry, process.cwd(), true);
+  } catch (err) {
+    fail(err);
+  }
+
   let metadata;
   try {
-    metadata = await fetchMetadata();
+    metadata = await fetchMetadata(registry);
   } catch (err) {
     fail(err);
   }
@@ -342,7 +405,57 @@ async function searchCmd(query: string[]): Promise<void> {
     console.log(`  ${id}  ${name} ${pc.dim(`· ${group}`)}`);
     if (dep.description) console.log(`  ${" ".repeat(idWidth)}  ${pc.dim(dep.description)}`);
   }
-  console.log(pc.dim(`\nUse them with: sbc create -d ${matches[0]!.dep.id}`));
+  console.log(
+    pc.dim(
+      `\nUse them with: sbc create -d ${matches[0]!.dep.id}${
+        registry.id !== "spring" ? ` --registry ${registry.id}` : ""
+      }`,
+    ),
+  );
+}
+
+/**
+ * Resolve the Initializr registry to scaffold from.
+ *
+ * `--registry` / `SBC_REGISTRY` / `sbc.config.json` are honoured; when nothing
+ * is configured an interactive picker is offered so the choice is discoverable
+ * rather than something you have to already know about.
+ */
+async function pickRegistry(
+  flagValue: string | undefined,
+  fromDir: string,
+  nonInteractive: boolean,
+): Promise<Registry> {
+  const source = await resolveRegistryFor(fromDir, flagValue, process.env, (message) =>
+    p.log.warn(message),
+  );
+
+  if (source.origin !== "default") {
+    const origin =
+      source.origin === "config" && source.file
+        ? pc.dim(` (from ${source.file})`)
+        : source.origin === "env"
+          ? pc.dim(" (from SBC_REGISTRY)")
+          : pc.dim(" (from --registry)");
+    p.log.info(`Registry: ${pc.cyan(source.registry.name)}${origin}`);
+    return source.registry;
+  }
+
+  if (nonInteractive || !process.stdin.isTTY) return source.registry;
+
+  const picked = await p.select({
+    message: "Initializr registry",
+    initialValue: source.registry.id,
+    options: REGISTRIES.map((r) => ({
+      value: r.id,
+      label: r.name,
+      hint:
+        r.id === "aliyun"
+          ? "Alibaba Cloud mirror — includes Spring Cloud Alibaba starters, best from mainland China"
+          : "Official Spring service — newest Boot versions",
+    })),
+  });
+  return resolveRegistry(p.isCancel(picked) ? undefined : picked);
 }
 
 async function listCmd(): Promise<void> {
@@ -385,11 +498,45 @@ async function workspaceInitCmd(dir: string): Promise<void> {
   }
 }
 
+async function configShowCmd(): Promise<void> {
+  const loaded = await loadConfig(process.cwd());
+  console.log(pc.dim(`Config file: ${loaded.file ?? "(none found)"}`));
+  console.log(pc.dim(`Searched from: ${loaded.dir}`));
+  console.log(
+    `registry:    ${loaded.config.registry ?? pc.dim(`(unset — defaults to spring)`)}`,
+  );
+
+  const source = await resolveRegistryFor(process.cwd(), undefined, process.env, () => {});
+  console.log(pc.dim(`\nEffective registry: ${source.registry.name} (${source.origin})`));
+}
+
+async function configSetCmd(key: string, value: string): Promise<void> {
+  if (key !== "registry") {
+    fail(new Error(`Unknown config key "${key}". Supported keys: registry`));
+  }
+  const registry = assertSettableRegistry(value);
+  const loaded = await loadConfig(process.cwd());
+  // Write next to the existing file so an inherited config is not duplicated
+  // in a child directory.
+  const dir = loaded.file ? dirname(loaded.file) : process.cwd();
+  const file = await writeConfig(dir, { ...loaded.config, registry: registry.id });
+  console.log(pc.green(`registry = ${registry.id}  (${registry.name})`));
+  console.log(pc.dim(`Written to ${file}`));
+}
+
+async function configPathCmd(): Promise<void> {
+  const loaded = await loadConfig(process.cwd());
+  console.log(loaded.file ?? pc.dim("No sbc.config.json found in this directory or any parent."));
+}
+
 function fail(err: unknown): never {
-  const message =
-    err instanceof InitializrError
-      ? `Error: ${err.message}`
-      : `Unexpected error: ${err instanceof Error ? err.message : String(err)}`;
+  const known =
+    err instanceof InitializrError ||
+    err instanceof UnknownRegistryError ||
+    (err instanceof Error && err.name === "UnknownRegistryError");
+  const message = known
+    ? `Error: ${err instanceof Error ? err.message : String(err)}`
+    : `Unexpected error: ${err instanceof Error ? err.message : String(err)}`;
   // Use plain stderr for non-interactive commands (search/run/list).
   process.stderr.write(`${pc.red(message)}\n`);
   process.exit(1);

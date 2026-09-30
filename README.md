@@ -7,7 +7,7 @@ English | [简体中文](./README.zh-CN.md)
 [![license](https://img.shields.io/npm/l/@jeangrey/sbc.svg)](./LICENSE)
 [![node](https://img.shields.io/node/v/@jeangrey/sbc.svg)](https://nodejs.org)
 
-A `vue-cli` style interactive CLI to **scaffold, search and run** Spring Boot projects — monorepo-aware, powered by [Spring Initializr](https://start.spring.io).
+A `vue-cli` style interactive CLI to **scaffold, search and run** Spring Boot projects — monorepo-aware, powered by [Spring Initializr](https://start.spring.io) or the [Alibaba Cloud mirror](https://start.aliyun.com).
 
 ## Features
 
@@ -15,6 +15,7 @@ A `vue-cli` style interactive CLI to **scaffold, search and run** Spring Boot pr
 - **Search / filter** dependencies by id, name or description — from the command line or a type-to-filter picker.
 - **Run** a generated project through its Maven/Gradle wrapper (`spring-boot:run` / `bootRun`).
 - **Monorepo** support: track multiple Spring Boot modules under one workspace and run any of them by name.
+- **Multiple registries** — switch between start.spring.io and start.aliyun.com per command, per project, or via an environment variable.
 
 ## Install
 
@@ -54,12 +55,73 @@ Key options:
 | `-f, --force` | Write into a non-empty directory |
 | `--run` | Run the project after generating |
 | `--module <name>` | Workspace module name to register |
+| `--registry <id>` | Initializr registry: `spring` \| `aliyun`, or a full URL |
+
+### Registries
+
+`sbc` can scaffold from any Initializr-compatible service. Two are built in:
+
+| Id | Service | Notes |
+| --- | --- | --- |
+| `spring` (default) | [start.spring.io](https://start.spring.io) | Official service, newest Boot versions |
+| `aliyun` | [start.aliyun.com](https://start.aliyun.com) | Alibaba Cloud mirror, adds Spring Cloud Alibaba / Nacos / Sentinel / RocketMQ starters, faster from mainland China |
+
+Pick one per invocation, persist it for a project, or set it in the environment:
+
+```bash
+# Per command
+sbc create my-app --registry aliyun -d web,data-jpa
+sbc search nacos --registry aliyun
+
+# Persist for the project (writes sbc.config.json)
+sbc config set registry aliyun
+sbc create my-app -d web
+
+# Environment variable
+export SBC_REGISTRY=aliyun
+```
+
+When nothing is configured, `sbc create` asks which registry to use interactively.
+
+Any other Initializr service works too — pass its base URL, and the Boot version
+is normalised to a coordinate that exists on Maven Central:
+
+```bash
+sbc create my-app --registry https://start.example.com -d web
+```
+
+`SBC_REGISTRY`, `sbc.config.json` and the flag accept the same values. Resolution
+order, highest priority first: `--registry` → `SBC_REGISTRY` → the nearest
+`sbc.config.json` (searched upwards from the target directory) → `spring`.
+
+Inspect the current configuration with:
+
+```bash
+sbc config show     # resolved values and the file they came from
+sbc config path     # path of the nearest sbc.config.json
+```
+
+```json
+{
+  "version": 1,
+  "registry": "aliyun"
+}
+```
+
+> **Note on Boot versions.** Spring Boot artifacts used a `.RELEASE` suffix
+> before 2.4.0 (`2.3.12.RELEASE`) and plain semver from 2.4.0 on (`2.6.13`).
+> `sbc` sends whichever form actually exists on Maven Central for the version
+> you pick, so generated builds resolve their BOM on both old and new releases —
+> regardless of which registry served the project.
 
 ### Search dependencies
 
 ```bash
 sbc search graphql
 sbc search "spring security"
+
+# Search the Alibaba Cloud registry instead
+sbc search nacos --registry aliyun
 ```
 
 ### Run a project
@@ -106,6 +168,7 @@ sbc run user-service
 ```bash
 pnpm install
 pnpm build      # bundle to dist/ with tsup
+pnpm test       # unit tests (node:test)
 pnpm dev        # watch mode
 ```
 
